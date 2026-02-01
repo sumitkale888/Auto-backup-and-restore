@@ -7,6 +7,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.io.File;
+import java.io.IOException; // Import standard IO Exception
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 @Service
@@ -16,26 +20,56 @@ public class RestoreService {
     @Autowired private CompressionUtil compressionUtil;
 
     @Value("${app.backup.source-directory}")
-    private String sourcePath; // We restore BACK to the source (Danger! Overwrites data)
+    private String sourcePath; 
 
     public void restoreBackup(Long jobId) throws Exception {
-        Optional<BackupJob> jobOpt = jobRepository.findById(jobId);
-        
-        if (jobOpt.isEmpty()) {
+        // 1. Get the requested backup
+        Optional<BackupJob> targetJobOpt = jobRepository.findById(jobId);
+        if (targetJobOpt.isEmpty()) {
             throw new Exception("Backup ID not found");
         }
-
-        BackupJob job = jobOpt.get();
-        if (job.getStatus() == BackupJob.BackupStatus.FAILED) {
+        BackupJob targetJob = targetJobOpt.get();
+        if (targetJob.getStatus() == BackupJob.BackupStatus.FAILED) {
             throw new Exception("Cannot restore a failed backup");
         }
 
-        // Logic: Unzip the stored file back to the source directory
-        // In a real 'incremental chain' restore, you would loop from Full -> Inc 1 -> Inc 2 -> Target
-        // For MVP, we unzip the specific point requested.
+        List<BackupJob> restoreChain = new ArrayList<>();
+
+        // 2. Build the Chain
+        if (targetJob.getType() == BackupJob.BackupType.FULL) {
+            // If user selected a FULL backup, we just restore that one
+            restoreChain.add(targetJob);
+        } else {
+            // If Incremental, we must find the base FULL backup
+            Optional<BackupJob> baseFullOpt = jobRepository.findBaseFullBackup(targetJob.getTimestamp());
+            if (baseFullOpt.isEmpty()) {
+                throw new Exception("Broken Chain: Could not find a Base FULL backup for this incremental point.");
+            }
+            BackupJob baseFull = baseFullOpt.get();
+
+            // Add the Base Full
+            restoreChain.add(baseFull);
+
+            // Add all Incrementals between Base and Target
+            List<BackupJob> intermediates = jobRepository.findIncrementalsBetween(baseFull.getTimestamp(), targetJob.getTimestamp());
+            restoreChain.addAll(intermediates);
+        }
+
+        // 3. Execute Restore (Loop through the chain)
+        System.out.println("Starting Chain Restore for Job ID: " + jobId);
         
-        System.out.println("Restoring from: " + job.getStoredPath());
-        compressionUtil.unzip(job.getStoredPath(), sourcePath);
-        System.out.println("Restore Completed!");
+        // Clean source directory before starting (Optional: Safety Step)
+        // cleanDirectory(new File(sourcePath)); 
+
+        for (BackupJob job : restoreChain) {
+            System.out.println(" -> Restoring part: " + job.getType() + " (ID: " + job.getId() + ")");
+            try {
+                compressionUtil.unzip(job.getStoredPath(), sourcePath);
+            } catch (IOException e) {
+                throw new Exception("Failed to unzip file: " + job.getStoredPath());
+            }
+        }
+        
+        System.out.println("Restore Chain Completed Successfully!");
     }
 }
